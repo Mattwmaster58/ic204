@@ -1,4 +1,4 @@
-Bascially everything was written by AI, including the rest of this Readme. It seems to work with public test cases, but I have not tested this on actual hardware yet.
+Bascially everything was written by AI, including the rest of this Readme. It seems to work with public test cases, but I have not tested this on actual hardware yet. It SHOULD work on SW versions 2129023005,2129021909,2129026108 - though the original work was done on the last SW version via CFF file.
 
 ----
 
