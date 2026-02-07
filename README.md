@@ -1,6 +1,10 @@
+Bascially everything was written by AI, including the rest of this Readme. It seems to work with public test cases, but I have not tested this on actual hardware yet.
+
+----
+
 # IC204 Seed-Key Algorithm
 
-Reverse-engineered seed-key algorithm for Mercedes-Benz W204 instrument cluster (IC204) with software part number **2129026108** (NEC V850E1 processor).
+Reverse-engineered seed-key algorithm for Mercedes-Benz instrument cluster (IC204) with software part number **2129026108** (NEC V850E1 processor).
 
 ## Overview
 
