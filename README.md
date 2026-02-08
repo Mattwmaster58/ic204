@@ -1,19 +1,25 @@
-Basically everything was written by AI, including the rest of this Readme. It seems to work with public test cases, but I have not tested this on actual hardware yet. It now supports SW versions 2129023005, 2129021909, 2129026108 (identical salt tables), and 2049022903 (different salt tables).
-
-----
-
 # IC204 Seed-Key Algorithm
 
 Reverse-engineered seed-key algorithm for Mercedes-Benz instrument cluster (IC204) with NEC V850E1 processor.
 
-**Original work was done on SW version 2129026108.** Additional SW versions are supported through salt table extraction from their respective CFF files.
+**Original work was done on SW version 2129026108.** Additional SW versions are supported through automated salt table extraction from CFF firmware images.
 
 ## Supported SW Versions
 
-- **2129026108** (default) — original implementation
-- **2129023005** — identical salts to 2129026108
-- **2129021909** — identical salts to 2129026108
-- **2049022903** — different salt tables
+31 firmware versions supported (26 unique salt tables, 5 aliases) across 6 series:
+
+| Series | Versions |
+|--------|----------|
+| 197902 | 1979021501, 1979023801, 1979025200, 1979027000 |
+| 204442 | 2044422521, 2044423021, 2044423621, 2044423921 |
+| 204902 | 2049022403, 2049022600, 2049022602, 2049022700, 2049022702, **2049022903** (=2049026403, =2049026503, =2049028303), 2049023401, 2049024102, 2049024301, 2049024802, 2049027103, 2049027203, 2049028902 |
+| 212442 | 2124420721 |
+| 212902 | **2129026108** (default) (=2129021909, =2129023005) |
+| 218902 | 2189020500, 2189021001, 2189028400 |
+
+Versions prefixed with `=` are aliases sharing identical salt tables with the preceding version.
+
+The core algorithm is bit-identical across all 31 firmware images — only the 7 per-level salt tables (8 bytes each) differ.
 
 ## Overview
 
@@ -37,6 +43,7 @@ key = ic204_generate_key(0x09, seed)
 print(f"Key: {key.hex().upper()}")  # Output: 775588C8850CF244
 
 # Specify SW version
+seed = bytes.fromhex("5C97A0A552FB0205")
 key = ic204_generate_key(0x09, seed, sw_version="2049022903")
 print(f"Key: {key.hex().upper()}")  # Output: D8F169D68D5D17B6
 ```
@@ -44,7 +51,7 @@ print(f"Key: {key.hex().upper()}")  # Output: D8F169D68D5D17B6
 ### Command Line
 
 ```bash
-# Compute key for a given level and seed
+# Compute key for a given level and seed (default SW version)
 python3 ic204_seedkey.py 09 212A2F38F98A8BD7
 
 # Specify SW version
@@ -98,23 +105,6 @@ The algorithm consists of three main firmware functions:
 4. **Feistel network** — 2 rounds, each with 2 half-rounds using rotation and 32-bit addition
 5. **Reverse permutation** — Rearrange result to produce the final key
 
-### Salt Tables
-
-**SW 2129026108** (also applies to 2129023005 and 2129021909):
-
-7 salt entries for internal levels 1-7 (only 1, 3, 5, 7 used by this ECU):
-- Level 1: 9F 85 1B 63 56 C5 85 DE
-- Level 3: 21 2B B9 C9 24 5A 4C A7
-- Level 5: C1 7C 39 EB DF D2 19 C4
-- Level 7: 91 D3 DF FB ED 23 42 15
-
-**SW 2049022903** (different salt tables):
-
-- Level 1: B2 AC 62 5D 69 ED CC D8
-- Level 3: 52 3B 4D 02 15 AE 6E 5C
-- Level 5: E1 C9 37 B1 F1 2B 71 68
-- Level 7: C1 15 83 E4 DC A9 74 74
-
 ### UDS Level Mapping
 
 UDS SecurityAccess sub-functions map to internal levels as:
@@ -125,9 +115,19 @@ UDS SecurityAccess sub-functions map to internal levels as:
 
 ## Files
 
-- **`ic204_seedkey.py`** — Complete, working Python implementation
+- **`ic204_seedkey.py`** — Complete Python implementation with 26 unique salt tables
+- **`robust_extract.py`** — Salt table extractor: decodes V850 instructions from CFF firmware images to extract per-version salt tables
 - **`disasm.txt`** — V850 disassembly of the three core firmware functions from Ghidra
 - **`ic204.gpr`** — Ghidra project file (for reference)
+
+## Salt Table Extraction
+
+The `robust_extract.py` tool extracts salt tables from CFF firmware images by:
+1. Locating the `salt_transform` function via its prologue signature
+2. Decoding V850 instructions (`movea`, `mov imm5`, `sst.b`, `st.b`, `mov reg,reg`)
+3. Tracking register state through each switch case to handle compiler optimizations (register reuse, small immediate values, shared epilogues)
+
+It found 31 CFF files containing the algorithm across all series in the CFF directory, producing 26 unique salt table groups.
 
 ## Reverse Engineering Notes
 
@@ -135,6 +135,7 @@ The firmware was analyzed in Ghidra as a V850 project. Key findings:
 - Functions: `FUN_00180b56`, `FUN_00180bd2`, `FUN_00180f14`
 - Critical stack frame bug: `FUN_00180bd2` uses `callt 0x13` which allocates its own local stack frame
 - Caller verification at `FUN_00175af8` confirmed the UDS-to-internal level mapping
+- Algorithm body is bit-identical across all 31 firmware images (only address relocations and tail padding differ)
 
 ## License
 
