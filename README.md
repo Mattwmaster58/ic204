@@ -1,3 +1,7 @@
+Almost this entire thing was AI generated. The only inputs being known-good seeds provided aggregated and provided by others (a big thank you to them!) in https://github.com/jglim/UnlockECU/issues/10 and the CFF files themselves. Everything below is what AI wrote:
+
+----
+
 # IC204 Seed-Key Algorithm
 
 Reverse-engineered seed-key algorithm for Mercedes-Benz instrument cluster (IC204) with NEC V850E1 processor.
