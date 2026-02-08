@@ -2,7 +2,11 @@
 """
 IC204 Seed-Key Algorithm
 Reverse engineered from V850 assembly (NEC V850E1 firmware for Mercedes W204 instrument cluster).
-Software part number: 2129026108
+Supports multiple SW versions with per-version salt tables.
+
+Supported SW versions:
+  2129026108 (default), 2129023005, 2129021909 — identical salt tables
+  2049022903 — different salt tables
 
 Firmware functions:
   FUN_00180b56 - rotate_right_array: right-rotates a byte array as a bitfield by 1 bit
@@ -24,6 +28,9 @@ Algorithm overview:
 
 Test vectors from https://github.com/jglim/UnlockECU/issues/10
 """
+
+import argparse
+import sys
 
 
 def rotate_right_array(buf, length):
@@ -53,15 +60,60 @@ def rotate_right_array(buf, length):
 # Per-level salt tables extracted from the switch statement in FUN_00180bd2.
 # Index = internal security level (1-7).
 # Each entry = 8 bytes stored at local[0x0C..0x13] in the function's stack frame.
-SALT_TABLE = {
-    1: [0x9F, 0x85, 0x1B, 0x63, 0x56, 0xC5, 0x85, 0xDE],
-    2: [0x1C, 0x77, 0x9A, 0x22, 0x71, 0xAE, 0x20, 0xCE],
-    3: [0x21, 0x2B, 0xB9, 0xC9, 0x24, 0x5A, 0x4C, 0xA7],
-    4: [0x62, 0xD9, 0x5B, 0xB2, 0x95, 0x48, 0xAD, 0x26],
-    5: [0xC1, 0x7C, 0x39, 0xEB, 0xDF, 0xD2, 0x19, 0xC4],
-    6: [0x7A, 0x40, 0x41, 0x31, 0x37, 0x9A, 0x87, 0x18],
-    7: [0x91, 0xD3, 0xDF, 0xFB, 0xED, 0x23, 0x42, 0x15],
+#
+# Outer key = SW version string. Multiple versions can share the same table.
+SALT_TABLES = {
+    "2129026108": {
+        1: [0x9F, 0x85, 0x1B, 0x63, 0x56, 0xC5, 0x85, 0xDE],
+        2: [0x1C, 0x77, 0x9A, 0x22, 0x71, 0xAE, 0x20, 0xCE],
+        3: [0x21, 0x2B, 0xB9, 0xC9, 0x24, 0x5A, 0x4C, 0xA7],
+        4: [0x62, 0xD9, 0x5B, 0xB2, 0x95, 0x48, 0xAD, 0x26],
+        5: [0xC1, 0x7C, 0x39, 0xEB, 0xDF, 0xD2, 0x19, 0xC4],
+        6: [0x7A, 0x40, 0x41, 0x31, 0x37, 0x9A, 0x87, 0x18],
+        7: [0x91, 0xD3, 0xDF, 0xFB, 0xED, 0x23, 0x42, 0x15],
+    },
+    "2049022903": {
+        1: [0xB2, 0xAC, 0x62, 0x5D, 0x69, 0xED, 0xCC, 0xD8],
+        2: [0x5C, 0x7C, 0xC3, 0x81, 0xB1, 0xB4, 0x4A, 0x2D],
+        3: [
+            0x52,
+            0x3B,
+            0x4D,
+            0x02,
+            0x15,
+            0xAE,
+            0x6E,
+            0x5C,
+        ],  # salt[3]=0x02 (r7=level-1)
+        4: [0x93, 0xE9, 0xDE, 0xEF, 0xF5, 0x53, 0x1C, 0x75],
+        5: [0xE1, 0xC9, 0x37, 0xB1, 0xF1, 0x2B, 0x71, 0x68],
+        6: [0xCB, 0x56, 0xFA, 0x5D, 0x88, 0xB0, 0x50, 0x46],
+        7: [0xC1, 0x15, 0x83, 0xE4, 0xDC, 0xA9, 0x74, 0x74],  # salt[7]=salt[6]=0x74
+    },
 }
+
+# Aliases: these SW versions share the same salt table as 2129026108.
+SW_ALIASES = {
+    "2129023005": "2129026108",
+    "2129021909": "2129026108",
+}
+
+DEFAULT_SW_VERSION = "2129026108"
+
+
+def get_salt_table(sw_version=None):
+    """Look up the salt table for a SW version, resolving aliases."""
+    if sw_version is None:
+        sw_version = DEFAULT_SW_VERSION
+    sw_version = str(sw_version)
+    resolved = SW_ALIASES.get(sw_version, sw_version)
+    if resolved not in SALT_TABLES:
+        raise ValueError(
+            f"Unknown SW version: {sw_version}. "
+            f"Supported: {', '.join(sorted(set(list(SALT_TABLES) + list(SW_ALIASES))))}"
+        )
+    return SALT_TABLES[resolved]
+
 
 # UDS SecurityAccess sub-function to internal level mapping.
 # The caller at FUN_00175af8 loads the internal level from a processed buffer
@@ -88,7 +140,7 @@ def uds_to_internal_level(uds_level):
     return (uds_level + 1) // 2
 
 
-def salt_transform(level):
+def salt_transform(level, sw_version=None):
     """
     FUN_00180bd2: Generate 8-byte LFSR initial state from salt only.
 
@@ -113,6 +165,7 @@ def salt_transform(level):
 
     Args:
         level: int, internal level 1-7
+        sw_version: str, SW version (default: 2129026108)
 
     Returns:
         bytearray of 8 bytes (written to caller's ws[0x08..0x0F])
@@ -120,7 +173,8 @@ def salt_transform(level):
     if level < 1 or level > 7:
         return bytearray(8)
 
-    salt = SALT_TABLE[level]
+    salt_table = get_salt_table(sw_version)
+    salt = salt_table[level]
     local = bytearray(0x14)
 
     # Store salt at local[0x0C..0x13]
@@ -244,13 +298,14 @@ def le32_store(buf, offset, val):
     buf[offset + 3] = (val >> 24) & 0xFF
 
 
-def ic204_generate_key(uds_level, seed):
+def ic204_generate_key(uds_level, seed, sw_version=None):
     """
-    FUN_00180f14: Main seed-to-key function for IC204 (SW 2129026108).
+    FUN_00180f14: Main seed-to-key function for IC204.
 
     Args:
         uds_level: int, UDS SecurityAccess sub-function (0x01, 0x03, 0x09, 0x0D)
         seed: bytes/bytearray, 8-byte seed from ECU
+        sw_version: str, SW version (default: 2129026108)
 
     Returns:
         bytearray, 8-byte key to send back, or None if level is invalid
@@ -282,7 +337,7 @@ def ic204_generate_key(uds_level, seed):
     lfsr_count = (ws[0x10 + level] & 0x07) + 2
 
     # Step 3: Generate LFSR initial state from salt
-    ws[0x08:0x10] = salt_transform(level)
+    ws[0x08:0x10] = salt_transform(level, sw_version)
 
     # Step 4: Run LFSR (feedback + rotate) for lfsr_count iterations
     for _ in range(lfsr_count):
@@ -340,26 +395,32 @@ def ic204_generate_key(uds_level, seed):
 
 
 def test():
-    """Test against known vectors from UnlockECU issue #10."""
+    """Test against known vectors."""
     test_cases = [
-        # (uds_level, seed_hex, expected_key_hex)
-        (0x01, "0000000000000000", "D632404B132FE12B"),
-        (0x03, "0000000000000000", "6552C46251393265"),
-        (0x09, "0000000000000000", "B83B5E73528197D3"),
-        (0x0D, "0000000000000000", "162FA93147161D00"),
-        (0x09, "212A2F38F98A8BD7", "775588C8850CF244"),
-        (0x09, "05E8242E8011F8FF", "B73353CD123F6837"),
-        (0x0D, "537C818A537C818A", "7FD7DCB083DCFB46"),
+        # (sw_version, uds_level, seed_hex, expected_key_hex)
+        # --- SW 2129026108 (original UnlockECU vectors) ---
+        ("2129026108", 0x01, "0000000000000000", "D632404B132FE12B"),
+        ("2129026108", 0x03, "0000000000000000", "6552C46251393265"),
+        ("2129026108", 0x09, "0000000000000000", "B83B5E73528197D3"),
+        ("2129026108", 0x0D, "0000000000000000", "162FA93147161D00"),
+        ("2129026108", 0x09, "212A2F38F98A8BD7", "775588C8850CF244"),
+        ("2129026108", 0x09, "05E8242E8011F8FF", "B73353CD123F6837"),
+        ("2129026108", 0x0D, "537C818A537C818A", "7FD7DCB083DCFB46"),
+        ("2129026108", 0x0D, "28C1050F7B52C7CE", "AC12805D446FDF54"),
+        # --- SW 2049022903 ---
+        ("2049022903", 0x09, "5C97A0A552FB0205", "D8F169D68D5D17B6"),
+        ("2049022903", 0x0D, "C1EBF4F94CA0A7A6", "49D4BE45A0B6DFF3"),
     ]
 
-    print("IC204 Seed-Key Algorithm Test (SW: 2129026108)")
-    print("=" * 72)
+    all_versions = sorted(set(sw for sw, _, _, _ in test_cases))
+    print("IC204 Seed-Key Algorithm Tests")
+    print("=" * 78)
 
     all_pass = True
-    for uds_level, seed_hex, expected_hex in test_cases:
+    for sw_version, uds_level, seed_hex, expected_hex in test_cases:
         seed = bytes.fromhex(seed_hex)
         expected = bytes.fromhex(expected_hex)
-        result = ic204_generate_key(uds_level, seed)
+        result = ic204_generate_key(uds_level, seed, sw_version)
 
         if result is None:
             result_hex = "None"
@@ -373,14 +434,85 @@ def test():
             all_pass = False
 
         print(
-            f"  Level 0x{uds_level:02X} | Seed: {seed_hex} "
+            f"  SW {sw_version} | Level 0x{uds_level:02X} | Seed: {seed_hex} "
             f"| Expected: {expected_hex} | Got: {result_hex} | {status}"
         )
 
-    print("=" * 72)
+    print("=" * 78)
     print("ALL TESTS PASSED!" if all_pass else "SOME TESTS FAILED")
     return all_pass
 
 
+def main():
+    supported_versions = sorted(set(list(SALT_TABLES) + list(SW_ALIASES)))
+
+    parser = argparse.ArgumentParser(
+        description="IC204 Seed-Key Algorithm — compute UDS SecurityAccess keys",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"Supported SW versions: {', '.join(supported_versions)}",
+    )
+    parser.add_argument(
+        "level",
+        nargs="?",
+        help="UDS SecurityAccess level in hex (e.g. 09, 0x0D)",
+    )
+    parser.add_argument(
+        "seed",
+        nargs="?",
+        help="8-byte seed as 16 hex chars (e.g. 5C97A0A552FB0205)",
+    )
+    parser.add_argument(
+        "--sw",
+        default=DEFAULT_SW_VERSION,
+        help=f"SW version (default: {DEFAULT_SW_VERSION})",
+    )
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Run built-in test vectors instead of computing a key",
+    )
+
+    args = parser.parse_args()
+
+    if args.test:
+        success = test()
+        sys.exit(0 if success else 1)
+
+    if args.level is None or args.seed is None:
+        parser.error("level and seed are required (or use --test)")
+
+    # Parse level — accept hex with or without 0x prefix, or plain decimal
+    level_str = args.level
+    try:
+        if level_str.startswith("0x") or level_str.startswith("0X"):
+            uds_level = int(level_str, 16)
+        else:
+            uds_level = int(level_str, 16)
+    except ValueError:
+        parser.error(f"Invalid level: {level_str}")
+
+    # Parse seed
+    seed_hex = args.seed.replace(" ", "")
+    if len(seed_hex) != 16:
+        parser.error(
+            f"Seed must be exactly 16 hex chars (8 bytes), got {len(seed_hex)}"
+        )
+    try:
+        seed = bytes.fromhex(seed_hex)
+    except ValueError:
+        parser.error(f"Invalid hex in seed: {seed_hex}")
+
+    try:
+        result = ic204_generate_key(uds_level, seed, args.sw)
+    except ValueError as e:
+        parser.error(str(e))
+
+    if result is None:
+        print(f"Error: invalid level 0x{uds_level:02X}", file=sys.stderr)
+        sys.exit(1)
+
+    print(result.hex().upper())
+
+
 if __name__ == "__main__":
-    test()
+    main()
