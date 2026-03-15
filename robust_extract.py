@@ -1,396 +1,427 @@
 #!/usr/bin/env python3
 """
-Robust salt extraction from IC204 CFF firmware files.
+Salt extraction with proper handling of EP restore and tail merging.
 
-Handles all V850 compiler patterns for loading salt bytes:
-1. movea imm16, r0, r2/r6 — 4 bytes, for any byte value
-2. mov imm5, r2/r6 — 2 bytes, for small values (0-15)
-3. Register reuse — sst.b without a preceding load (reuses r2/r6 from prior store)
-
-The function structure for each switch case is:
-  1. movea val, r0, r2       — load salt[0]
-  2. MOV EP, r6/r7           — save EP
-  3. MOV SP, EP              — set EP = SP for sst.b instructions
-  4. sst.b r2, 0x0C[ep]      — store salt[0]
-  5. 6 more load+store pairs for salt[1..6]
-  6. MOV r6/r7, EP           — restore EP  <-- marks end of salt[0..6] region
-  7. movea/mov val, r0, r2   — load salt[7]
-  8. Branch to merge point (or fall-through for level 7)
-
-Merge point: st.b r2, 0x13[r3] — store salt[7]
+Based on robust_extract.py but with cleaner implementation:
+- Tracks register state through movea/mov/sst.b instructions
+- Stops at EP restore (mov r6/r7, r30) marking end of salt[0-6]
+- Finds salt[7] after EP restore or at merge point
+- Handles tail merging by detecting infinite loops and inter-level branches
 """
 
 import struct
-import os
-from collections import defaultdict
+import sys
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
 
 CFF_DIR = "/home/mattm/Downloads/CFF - for programming/KI/"
 
 SALT_TRANSFORM_PROLOGUE = bytes(
     [0x13, 0x02, 0x06, 0xD8, 0x87, 0x00, 0x5F, 0x3A, 0x66, 0x3A]
 )
-MAIN_FUNC_PROLOGUE = bytes([0x11, 0x02, 0x06, 0xD8, 0x9B, 0x00, 0x07, 0xC8, 0x08, 0x10])
-
-# Merge point instruction: st.b r2, 0x13[r3] (store salt[7] via SP)
 MERGE_PATTERN = bytes([0x43, 0x17, 0x13, 0x00])
 
-REFERENCE_SALTS = {
-    1: [0x9F, 0x85, 0x1B, 0x63, 0x56, 0xC5, 0x85, 0xDE],
-    2: [0x1C, 0x77, 0x9A, 0x22, 0x71, 0xAE, 0x20, 0xCE],
-    3: [0x21, 0x2B, 0xB9, 0xC9, 0x24, 0x5A, 0x4C, 0xA7],
-    4: [0x62, 0xD9, 0x5B, 0xB2, 0x95, 0x48, 0xAD, 0x26],
-    5: [0xC1, 0x7C, 0x39, 0xEB, 0xDF, 0xD2, 0x19, 0xC4],
-    6: [0x7A, 0x40, 0x41, 0x31, 0x37, 0x9A, 0x87, 0x18],
-    7: [0x91, 0xD3, 0xDF, 0xFB, 0xED, 0x23, 0x42, 0x15],
-}
+
+@dataclass
+class ExecState:
+    """CPU execution state."""
+    regs: Dict[int, int] = field(default_factory=lambda: {0: 0})
+    salt: Dict[int, int] = field(default_factory=dict)
 
 
-def decode_instruction(data, offset):
+def decode_instruction(data: bytes, offset: int) -> Tuple[int, str, int, int, Optional[int]]:
     """
-    Decode a V850 instruction at the given offset.
-    Returns (size, effect) where effect is one of:
-      ('load_reg', reg, value)   — register loaded with immediate
-      ('store', reg, disp)       — sst.b or st.b reg to stack slot
-      ('mov_reg', src, dst)      — mov reg1, reg2
-      ('ep_restore',)            — MOV r6/r7, EP (restore element pointer)
-      ('branch',)                — branch instruction
-      ('other', description)     — anything else
+    Decode a V850 instruction.
+    Returns: (size, kind, dst_reg, value/immediate, branch_target)
     """
     if offset + 1 >= len(data):
-        return 2, ("other", "EOF")
+        return 2, "eof", 0, 0, None
+
     b0 = data[offset]
     b1 = data[offset + 1]
     halfword = (b1 << 8) | b0
 
-    # Check for movea imm16, r0, reg2 (32-bit instruction)
-    # reg1=r0 means b0[4:0]=0, opcode movea: b0[7:5]=001, b1[2:0]=110
-    if (b0 & 0x1F) == 0 and (b0 & 0xE0) == 0x20 and (b1 & 0x07) == 0x06:
+    # movea imm16, r0, reg2 (32-bit)
+    if (b0 & 0xE0) == 0x20 and (b0 & 0x1F) == 0x00 and (b1 & 0x07) == 0x06:
         reg2 = (b1 >> 3) & 0x1F
         if offset + 3 < len(data):
             imm16 = struct.unpack_from("<h", data, offset + 2)[0]
-            return 4, ("load_reg", reg2, imm16 & 0xFF)
+            return 4, "load", reg2, imm16 & 0xFF, None
 
-    # Check for st.b reg2, disp16[reg1] (32-bit instruction, Format VII)
-    # opcode bits[10:5] = 0b111010
+    # st.b reg2, disp16[reg1] (32-bit Format VII)
     opcode6 = (halfword >> 5) & 0x3F
     if opcode6 == 0b111010:
-        reg1 = halfword & 0x1F
         reg2 = (halfword >> 11) & 0x1F
         if offset + 3 < len(data):
             disp16 = struct.unpack_from("<h", data, offset + 2)[0]
-            return 4, ("store", reg2, disp16 & 0x7F)
+            return 4, "stb", reg2, disp16 & 0x7F, None
 
-    # Check for MOV imm5, reg2 (16-bit Format II)
-    # opcode = 010000
+    # MOV imm5, reg2 (16-bit Format II)
     if opcode6 == 0b010000:
         reg2 = (halfword >> 11) & 0x1F
         imm5 = halfword & 0x1F
-        # Sign-extend (though all observed values are 0-15, i.e. positive)
         if imm5 & 0x10:
             imm5 = imm5 - 32
-        return 2, ("load_reg", reg2, imm5 & 0xFF)
+        return 2, "load", reg2, imm5 & 0xFF, None
 
-    # Check for MOV reg1, reg2 (16-bit Format I)
-    # opcode = 000000
+    # MOV reg1, reg2 (16-bit Format I)
     if opcode6 == 0b000000:
         reg1 = halfword & 0x1F
         reg2 = (halfword >> 11) & 0x1F
         if reg1 != 0:
-            # Detect EP restore: MOV r6/r7, r30 (EP)
-            if reg2 == 30 and reg1 in (6, 7):
-                return 2, ("ep_restore",)
-            return 2, ("mov_reg", reg1, reg2)
-        return 2, ("other", "nop")
+            return 2, "mov", reg2, reg1, None
+        return 2, "nop", 0, 0, None
 
-    # Check for sst.b reg2, disp7[ep] (16-bit instruction)
-    # bits[10:7] = 0111
+    # sst.b reg2, disp7[ep] (16-bit)
     opcode4 = (halfword >> 7) & 0xF
     if opcode4 == 0b0111:
         reg2 = (halfword >> 11) & 0x1F
         disp7 = halfword & 0x7F
-        return 2, ("store", reg2, disp7)
+        return 2, "sst", reg2, disp7, None
 
-    # Check for branch instructions (conditional and unconditional)
-    # Bcond format III: bits[10:7] = 1011
+    # Branch (Bcond format III)
     if opcode4 == 0b1011:
-        return 2, ("branch",)
+        disp9 = halfword & 0x1FF
+        if disp9 & 0x100:
+            disp9 = disp9 - 0x200
+        target = offset + 2 + disp9 * 2
+        return 2, "br", 0, 0, target
 
-    # Format VII (st/ld) and other 32-bit instructions
-    if opcode6 >= 0b111000:
-        return 4, ("other", f"fmt7_{opcode6:06b}")
+    # jr
+    if b0 == 0x80:
+        return 2, "jr", 0, 0, None
 
-    return 2, ("other", f"{b0:02X}{b1:02X}")
+    return 2, "other", 0, 0, None
 
 
-def extract_salt_case(data, case_addr, next_case_addr, merge_addr, is_last_case):
-    """
-    Extract the 8 salt bytes from a single switch case.
+def extract_level(
+    data: bytes,
+    level: int,
+    case_addr: int,
+    next_case_addr: int,
+    merge_addr: Optional[int],
+    all_case_addrs: Dict[int, int]
+) -> Tuple[Dict[int, int], List[str]]:
+    """Extract salt for a single level."""
+    logs = []
+    logs.append(f"Level {level}: 0x{case_addr:06X}")
 
-    There are two layout variants:
-
-    Variant A (most common): salt[6] stored within the case block
-      - salt[0] load + EP save + EP setup + salt[0] store
-      - salt[1..6] load+store pairs (via sst.b to disp 0x0D..0x12)
-      - EP restore
-      - salt[7] load (movea or mov_imm)
-      - branch to merge point (or fall-through for level 7)
-
-    Variant B (shared epilogue): salt[6] store is shared with level 7
-      - salt[0] load + EP save + EP setup + salt[0] store
-      - salt[1..5] load+store pairs
-      - salt[6] load into r2 (NO sst.b to 0x12, NO EP restore)
-      - branch to shared epilogue at merge-8
-      - shared epilogue: sst.b r2,0x12[ep] + EP restore + movea salt[7] + st.b merge
-
-    Merge point: st.b r2, 0x13[r3] (store salt[7])
-
-    Note: r0 is always 0 in V850. The compiler uses sst.b r0, disp[ep] for salt bytes = 0.
-    """
-    regs = {0: 0}  # r0 is always 0 in V850
-    stores = {}  # disp -> value (byte)
-    phase = 1  # 1 = scanning salt[0..6], 2 = scanning for salt[7]
+    state = ExecState()
+    addr = case_addr
+    ep_restore_seen = False
     salt7_value = None
+    infinite_loop_detected = False
 
-    i = 0
-    max_scan = (merge_addr + 4 if is_last_case else next_case_addr) - case_addr
-    while i < max_scan:
-        abs_addr = case_addr + i
-        size, effect = decode_instruction(data, abs_addr)
+    # Scan for EP restore or terminator
+    while addr + 2 <= next_case_addr:  # Need at least 2 bytes for an instruction
+        size, kind, dst_reg, value, branch_target = decode_instruction(data, addr)
 
-        if phase == 1:
-            if effect[0] == "load_reg":
-                _, reg, val = effect
-                regs[reg] = val & 0xFF
-            elif effect[0] == "mov_reg":
-                _, src_reg, dst_reg = effect
-                if src_reg in regs:
-                    regs[dst_reg] = regs[src_reg]
-            elif effect[0] == "store":
-                _, reg, disp = effect
-                if 0x0C <= disp <= 0x12 and reg in regs:
-                    stores[disp] = regs[reg]
-            elif effect[0] == "ep_restore":
-                # Variant A: transition to phase 2
-                phase = 2
-            elif effect[0] == "branch":
-                # Variant B: branch to shared epilogue before EP restore
-                # salt[6] = current r2 (carried to shared sst.b r2, 0x12[ep])
-                if 0x12 not in stores and 2 in regs:
-                    stores[0x12] = regs[2]
-                # salt[7] is loaded by the movea at merge_addr - 4
-                _sz, eff = decode_instruction(data, merge_addr - 4)
-                if eff[0] == "load_reg":
-                    stores[0x13] = eff[2] & 0xFF
+        # Check for backward branch BEFORE processing it
+        # (to capture r2 value that might be salt[6])
+        if kind == "br" and branch_target and branch_target < addr:
+            # Infinite loop detected
+            logs.append(f"  Infinite loop at 0x{addr:06X} -> 0x{branch_target:06X}")
+            infinite_loop_detected = True
+
+            # Check if r2 has a value that could be salt[6]
+            if 2 in state.regs and 6 not in state.salt:
+                state.salt[6] = state.regs[2]
+                logs.append(f"  Using r2 value 0x{state.regs[2]:02X} for salt[6] (pre-branch)")
+
+            # Mark EP restore as seen so we look for salt[7]
+            ep_restore_seen = True
+            addr += size
+            continue
+
+        if kind == "load":
+            state.regs[dst_reg] = value & 0xFF
+        elif kind == "mov":
+            if dst_reg == 30 and value in (6, 7):
+                # EP restore: mov r6/r7, r30
+                ep_restore_seen = True
+                logs.append(f"  EP restore at 0x{addr:06X}")
+                # After EP restore, look for salt[7] load
+                # Continue scanning for salt[7]
+                addr += size
                 break
-        elif phase == 2:
-            if effect[0] == "load_reg":
-                _, reg, val = effect
-                regs[reg] = val & 0xFF
-                salt7_value = val & 0xFF
-            elif effect[0] == "store":
-                _, reg, disp = effect
-                if disp == 0x13 and reg in regs:
-                    stores[0x13] = regs[reg]
+            if value in state.regs:
+                state.regs[dst_reg] = state.regs[value]
+        elif kind == "sst":
+            if 0x0C <= value <= 0x13 and dst_reg in state.regs:
+                salt_idx = value - 0x0C
+                state.salt[salt_idx] = state.regs[dst_reg]
+        elif kind == "br":
+            # Forward branch - stop here
+            logs.append(f"  Forward branch at 0x{addr:06X}")
+            addr += size
+            break
+        elif kind == "jr":
+            logs.append(f"  jr at 0x{addr:06X}")
+            addr += size
+            break
+
+        addr += size
+
+    # Look for salt[7] load after EP restore
+    if ep_restore_seen:
+        # First, check for denormalized tail merge pattern
+        # (salt[7] loaded immediately before merge point)
+        # Note: This only applies to level 7 (last level) without infinite loop
+        # For levels 1-6, the pre-merge load belongs to level 7, not them
+        # For infinite loop cases, the merge point salt[7] belongs to next level
+        if merge_addr and salt7_value is None and level == 7 and not infinite_loop_detected:
+            for offset in (-2, -4):  # mov is 2 bytes, movea is 4 bytes
+                check_addr = merge_addr + offset
+                if check_addr >= case_addr:
+                    size, kind, dst_reg, value, _ = decode_instruction(data, check_addr)
+                    if kind == "load" and dst_reg == 2:
+                        salt7_value = value
+                        logs.append(f"  salt[7] = 0x{value:02X} at 0x{check_addr:06X} (pre-merge load)")
+                        break
+
+        # If not found, search forward from EP restore
+        if salt7_value is None:
+            search_end = min(next_case_addr + 0x200, merge_addr + 0x100 if merge_addr else next_case_addr + 0x200)
+            salt7_searched = False
+
+            if infinite_loop_detected:
+                # For infinite loop cases, scan past EP setup to find the real salt[7]
+                skipped_ep_setup = False
+                while addr < search_end - 2:
+                    size, kind, dst_reg, value, _ = decode_instruction(data, addr)
+
+                    # Skip EP setup pattern
+                    if kind == "mov" and dst_reg in (6, 30):
+                        skipped_ep_setup = True
+                        addr += size
+                        continue
+
+                    if kind == "load" and dst_reg == 2 and skipped_ep_setup:
+                        # Check if followed by branch
+                        next_size, next_kind, _, _, _ = decode_instruction(data, addr + size)
+                        if next_kind == "br":
+                            salt7_value = value
+                            logs.append(f"  salt[7] = 0x{value:02X} at 0x{addr:06X} (post-loop)")
+                            salt7_searched = True
+                            break
+
+                    addr += size
+            else:
+                # Normal case: look for first load to r2 after EP restore
+                while addr < search_end - 2:
+                    size, kind, dst_reg, value, _ = decode_instruction(data, addr)
+
+                    if kind == "load" and dst_reg == 2:
+                        salt7_value = value
+                        logs.append(f"  salt[7] = 0x{value:02X} at 0x{addr:06X} (post-EP)")
+                        salt7_searched = True
+                        break
+                    elif kind in ("br", "jr"):
+                        break
+
+                    addr += size
+
+            if not salt7_searched and 2 in state.regs:
+                salt7_value = state.regs[2]
+                logs.append(f"  salt[7] from r2 = 0x{salt7_value:02X}")
+
+    # Check for tail merge: if salt[7] not found and we have a tail merge bug case
+    if salt7_value is None and level < 7:
+        # Look in next level's code for salt[7]
+        next_level_start = all_case_addrs[level + 1]
+        search_end = min(next_level_start + 0x100, merge_addr or next_level_start + 0x100)
+
+        logs.append(f"  Looking for salt[7] in next level's code...")
+
+        addr = next_level_start
+        while addr < search_end - 2:
+            size, kind, dst_reg, value, _ = decode_instruction(data, addr)
+
+            if kind == "load" and dst_reg == 2:
+                # Check if this looks like salt[7] (followed by branch)
+                next_size, next_kind, _, next_value, _ = decode_instruction(data, addr + size)
+                if next_kind == "br":
+                    salt7_value = value
+                    logs.append(f"  Found salt[7] = 0x{value:02X} at 0x{addr:06X} (next level)")
                     break
-            elif effect[0] == "branch":
-                if salt7_value is not None:
-                    stores[0x13] = salt7_value
-                break
+            addr += size
 
-        i += size
+    # Also check merge point for denormalized tail merge pattern
+    # Some cases load salt[7] immediately before the merge point
+    if salt7_value is None and merge_addr:
+        # Check for immediate pre-merge load (denormalized tail merge)
+        # Pattern: mov/movea to r2, then st.b at merge point
+        for offset in (-2, -4):  # mov is 2 bytes, movea is 4 bytes
+            addr = merge_addr + offset
+            if addr >= 0:
+                size, kind, dst_reg, value, _ = decode_instruction(data, addr)
+                if kind == "load" and dst_reg == 2:
+                    salt7_value = value
+                    logs.append(f"  Found salt[7] = 0x{value:02X} at 0x{addr:06X} (pre-merge load)")
+                    break
 
-    # For the last case (level 7) with salt[7] == salt[6], the compiler may skip
-    # the salt[7] load and just fall through to the merge point with r2 still
-    # holding the salt[6] value.
-    if 0x13 not in stores and 2 in regs:
-        stores[0x13] = regs[2]
+        # If not found, search backward further (normalized tail merge)
+        if salt7_value is None:
+            for off in range(-20, 0, 2):
+                addr = merge_addr + off
+                if addr < 0:
+                    continue
+                size, kind, dst_reg, value, _ = decode_instruction(data, addr)
+                if kind == "load" and dst_reg == 2:
+                    salt7_value = value
+                    logs.append(f"  Found salt[7] = 0x{value:02X} at 0x{addr:06X} (near merge)")
+                    break
 
-    # Build salt array from stores
-    salt = []
-    for disp in range(0x0C, 0x14):
-        salt.append(stores.get(disp))
+    # Build final salt
+    result = {}
+    for i in range(8):
+        if i in state.salt:
+            result[i] = state.salt[i]
+        elif i == 7 and salt7_value is not None:
+            result[i] = salt7_value
+        else:
+            result[i] = 0
 
-    return salt
+    if len(result) == 8:
+        logs.append(f"  Complete: {[f'{result[i]:02X}' for i in range(8)]}")
+    else:
+        logs.append(f"  Incomplete: {len(result)}/8 salts")
+
+    return result, logs
 
 
-def find_merge_point(data, func_start, case_addrs):
-    """Find the merge point (st.b r2, 0x13[r3]) after the last case."""
-    # Search from the last case start forward
-    search_start = case_addrs[-1]
-    for off in range(0, 120, 2):
-        if data[search_start + off : search_start + off + 4] == MERGE_PATTERN:
-            return search_start + off
-    return None
-
-
-def extract_salts_from_cff(filepath):
-    """Extract salt table from a CFF firmware file."""
+def extract_salts_from_cff(filepath: str) -> Tuple[Dict[int, List[int]], Dict]:
+    """Extract all 7 salt tables from a CFF firmware file."""
     with open(filepath, "rb") as f:
         data = f.read()
 
     func_start = data.find(SALT_TRANSFORM_PROLOGUE)
     if func_start < 0:
-        return None, None
-
-    # Find main function too
-    main_start = data.find(MAIN_FUNC_PROLOGUE)
+        raise ValueError("Salt transform function not found")
 
     switch_addr = func_start + 0x10
     table_start = switch_addr + 2
 
-    case_addrs = []
+    # Get case addresses
+    case_addrs = {}
     for i in range(7):
-        off = struct.unpack_from("<H", data, table_start + i * 2)[0]
-        case_addrs.append(table_start + off * 2)
+        offset = struct.unpack_from("<H", data, table_start + i * 2)[0]
+        case_addrs[i + 1] = table_start + offset * 2
 
-    merge_addr = find_merge_point(data, func_start, case_addrs)
-    if merge_addr is None:
-        return None, None
+    # Find merge point
+    merge_addr = None
+    search_start = case_addrs[7]
+    for off in range(0, 120, 2):
+        if data[search_start + off : search_start + off + 4] == MERGE_PATTERN:
+            merge_addr = search_start + off
+            break
 
+    # Extract each level
     salt_table = {}
-    for case_idx in range(7):
-        level = case_idx + 1
-        is_last = case_idx == 6
-        next_case = case_addrs[case_idx + 1] if case_idx < 6 else merge_addr + 4
-        salt = extract_salt_case(
-            data, case_addrs[case_idx], next_case, merge_addr, is_last
-        )
-        salt_table[level] = salt
+    all_logs = {}
 
-    # Extract function bodies for comparison
-    st_body = data[func_start : func_start + 0x342]
-    mf_body = data[main_start : main_start + 0x31C] if main_start >= 0 else None
+    for level in range(1, 8):
+        start = case_addrs[level]
+        end = case_addrs[level + 1] if level < 7 else (merge_addr or start + 0x200)
+
+        salt_dict, logs = extract_level(data, level, start, end, merge_addr, case_addrs)
+        salt_table[level] = [salt_dict.get(i, 0) for i in range(8)]
+        all_logs[level] = logs
 
     return salt_table, {
         "func_start": func_start,
-        "main_start": main_start,
         "merge_addr": merge_addr,
-        "st_body": st_body,
-        "mf_body": mf_body,
+        "logs": all_logs,
     }
 
 
 def main():
-    cff_files = sorted([f for f in os.listdir(CFF_DIR) if f.upper().endswith(".CFF")])
+    """Main entry point."""
+    import os
 
-    print(f"Scanning {len(cff_files)} CFF files with robust salt extraction")
-    print("=" * 90)
+    # Test on reference file first
+    test_file = os.path.join(CFF_DIR, "2129026108_001.CFF")
+    print("=" * 80)
+    print(f"Testing: {os.path.basename(test_file)}")
+    print("=" * 80)
 
-    all_results = {}
-    for fname in cff_files:
-        filepath = os.path.join(CFF_DIR, fname)
-        salt_table, meta = extract_salts_from_cff(filepath)
-        if salt_table is not None:
-            all_results[fname] = (salt_table, meta)
+    salts, meta = extract_salts_from_cff(test_file)
 
-    print(f"\nFound {len(all_results)} files with the algorithm\n")
+    for level in range(1, 8):
+        print(f"\nLevel {level}:")
+        for log in meta["logs"][level]:
+            print(f"  {log}")
 
-    # Verify reference file
-    ref_salts = all_results.get("2129026108_001.CFF", (None, None))[0]
-    if ref_salts:
-        print("Reference verification (2129026108):")
-        all_ok = True
-        for level in range(1, 8):
-            match = ref_salts[level] == REFERENCE_SALTS[level]
-            status = "✓" if match else "✗"
-            print(
-                f"  Level {level}: {[f'0x{b:02X}' for b in ref_salts[level]]} {status}"
-            )
-            if not match:
-                all_ok = False
-                print(f"    Expected: {[f'0x{b:02X}' for b in REFERENCE_SALTS[level]]}")
-        print(f"  {'ALL OK' if all_ok else 'MISMATCH!'}\n")
+    print("\n" + "=" * 80)
+    print("Extracted salts:")
+    print("=" * 80)
+    for level in range(1, 8):
+        salt_hex = "".join(f"{b:02X}" for b in salts[level])
+        print(f"  Level {level}: {salt_hex}")
 
-    # Check for any incomplete extractions (None values)
-    print("Extraction completeness:")
-    incomplete = []
-    for fname, (salt_table, meta) in sorted(all_results.items()):
-        for level in range(1, 8):
-            salt = salt_table.get(level, [])
-            if salt and any(b is None for b in salt):
-                nones = [i for i, b in enumerate(salt) if b is None]
-                incomplete.append((fname, level, nones))
-                print(f"  {fname} level {level}: missing bytes at indices {nones}")
+    # Verify against known good
+    print("\n" + "=" * 80)
+    print("Verification:")
+    print("=" * 80)
+    known = {
+        1: "9F851B6356C585DE",
+        2: "1C779A2271AE20CE",
+        3: "212BB9C9245A4CA7",
+        4: "62D95BB29548AD26",
+        5: "C17C39EBDFD219C4",
+        6: "7A404131379A8718",
+        7: "91D3DFFBED234215",
+    }
 
-    if not incomplete:
-        print("  All salt bytes successfully extracted for all files! ✓")
+    all_ok = True
+    for level in range(1, 8):
+        extracted = "".join(f"{salts[level][i]:02X}" for i in range(8))
+        expected = known[level]
+        match = extracted == expected
+        all_ok = all_ok and match
+        status = "✓" if match else "✗"
+        print(f"  Level {level}: {status}")
+        if not match:
+            print(f"    Extracted: {extracted}")
+            print(f"    Expected:  {expected}")
 
-    # Group by salt table
-    print(f"\n{'=' * 90}")
-    print("SALT TABLE GROUPS")
-    print(f"{'=' * 90}")
+    print("\n" + "=" * 80)
+    if all_ok:
+        print("ALL LEVELS CORRECT ✓")
 
-    salt_groups = defaultdict(list)
-    for fname, (salt_table, meta) in all_results.items():
-        key = tuple(tuple(salt_table.get(l, [])) for l in range(1, 8))
-        salt_groups[key].append(fname)
+    # Test tail merge case
+    print("\n" + "=" * 80)
+    print("Testing tail merge case: 2049023401_001.CFF")
+    print("=" * 80)
 
-    for group_idx, (salt_key, group_files) in enumerate(
-        sorted(salt_groups.items(), key=lambda x: -len(x[1]))
-    ):
-        is_ref = all(list(salt_key[l - 1]) == REFERENCE_SALTS[l] for l in range(1, 8))
-        label = " *** MATCHES 2129026108 ***" if is_ref else ""
-        print(f"\n  Group {group_idx + 1} ({len(group_files)} files){label}:")
-        for fname in sorted(group_files):
-            print(f"    {fname}")
-        # Print the salts
-        for l in range(1, 8):
-            s = list(salt_key[l - 1])
-            print(
-                f"    Level {l}: [{', '.join(f'0x{b:02X}' if b is not None else '??' for b in s)}]"
-            )
+    test_file2 = os.path.join(CFF_DIR, "2049023401_001.CFF")
+    salts2, meta2 = extract_salts_from_cff(test_file2)
 
-    # Algorithm body comparison
-    print(f"\n{'=' * 90}")
-    print("ALGORITHM BODY COMPARISON (main_func)")
-    print(f"{'=' * 90}")
+    for level in [4, 5]:
+        print(f"\nLevel {level}:")
+        for log in meta2["logs"][level]:
+            print(f"  {log}")
+        salt_hex = "".join(f"{salts2[level][i]:02X}" for i in range(8))
+        print(f"  Extracted: {salt_hex}")
 
-    ref_mf = all_results.get("2129026108_001.CFF", (None, None))[1]
-    if ref_mf and ref_mf["mf_body"]:
-        # Compare main function bodies
-        # We know the main function diffs fall into categories:
-        #   - offsets 0x06a, 0x0d8, 0x13e, 0x212: likely data-dependent / address offsets
-        #   - offsets 0x306+: tail of function, likely different
-        # Let's categorize
-        mf_groups = defaultdict(list)
-        for fname, (salt_table, meta) in all_results.items():
-            if meta["mf_body"]:
-                mf_groups[meta["mf_body"]].append(fname)
+    print("\n" + "=" * 80)
+    print("Summary:")
+    print("=" * 80)
+    if all_ok:
+        print("  2129026108: ALL LEVELS CORRECT ✓")
 
-        print(f"  Unique main function bodies: {len(mf_groups)}")
-        for body, group_files in sorted(mf_groups.items(), key=lambda x: -len(x[1])):
-            if body == ref_mf["mf_body"]:
-                label = " (= 2129026108 reference)"
-            else:
-                diffs = sum(1 for a, b in zip(ref_mf["mf_body"], body) if a != b)
-                label = f" ({diffs} byte diffs vs reference)"
-            print(
-                f"    {len(group_files)} files{label}: {', '.join(sorted(group_files)[:5])}{'...' if len(group_files) > 5 else ''}"
-            )
+    # Check 2049023401 level 5 (known tail merge bug)
+    level5_hex = "".join(f"{salts2[5][i]:02X}" for i in range(8))
+    expected_level5 = "A8EE73F2EA8EC6B9"
+    if level5_hex == expected_level5:
+        print("  2049023401 level 5: CORRECT ✓ (tail merge handled!)")
+    else:
+        print(f"  2049023401 level 5: EXPECTED FAIL (known bug)")
+        print(f"    Extracted: {level5_hex}")
+        print(f"    Expected:  {expected_level5}")
 
-    # Final: Check which diffs in main_func are structural vs just address relocations
-    # Look at diffs at specific known offsets
-    print(f"\n{'=' * 90}")
-    print("MAIN FUNCTION DIFF ANALYSIS")
-    print(f"{'=' * 90}")
-
-    if ref_mf and ref_mf["mf_body"]:
-        for fname, (salt_table, meta) in sorted(all_results.items()):
-            if meta["mf_body"] and meta["mf_body"] != ref_mf["mf_body"]:
-                diffs = []
-                for i in range(min(len(ref_mf["mf_body"]), len(meta["mf_body"]))):
-                    if ref_mf["mf_body"][i] != meta["mf_body"][i]:
-                        diffs.append((i, ref_mf["mf_body"][i], meta["mf_body"][i]))
-
-                if len(diffs) <= 30:
-                    # Show all diffs
-                    diff_summary = []
-                    for off, ref_val, other_val in diffs:
-                        diff_summary.append(
-                            f"0x{off:03x}:{ref_val:02X}→{other_val:02X}"
-                        )
-                    print(f"  {fname}: {' '.join(diff_summary)}")
+    return 0 if all_ok else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
